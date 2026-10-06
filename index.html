@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Robot Arm Web Bluetooth</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Fira+Code:wght@500&display=swap" rel="stylesheet">
+    
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            touch-action: manipulation;
+        }
+        .font-mono { font-family: 'Fira Code', monospace; }
+        
+        /* Custom Range Slider tối ưu cho cảm ứng điện thoại */
+        input[type=range] {
+            -webkit-appearance: none;
+            width: 100%;
+            background: transparent;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 32px;
+            width: 32px;
+            border-radius: 50%;
+            background: #3b82f6;
+            cursor: pointer;
+            margin-top: -13px;
+            box-shadow: 0 0 12px rgba(59, 130, 246, 0.6);
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 8px;
+            cursor: pointer;
+            background: #334155;
+            border-radius: 4px;
+        }
+        
+        .led-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+            box-shadow: 0 0 8px currentColor;
+        }
+        .status-disconnected { color: #ef4444; background-color: #ef4444; }
+        .status-connected { color: #10b981; background-color: #10b981; }
+    </style>
+</head>
+<body class="min-h-screen p-4 flex flex-col justify-between max-w-md mx-auto">
+
+    <!-- Header & Trạng thái -->
+    <header class="mb-4">
+        <h1 class="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-emerald-400 text-center">
+            ROBOT ARM BLE
+        </h1>
+        <p class="text-xs text-slate-400 text-center mt-1">Điều khiển qua Web Bluetooth (HM-10 / BLE)</p>
+        
+        <div class="mt-4 bg-slate-800 p-3 rounded-xl border border-slate-700 flex items-center justify-between">
+            <div class="flex items-center">
+                <div id="statusLed" class="led-indicator status-disconnected"></div>
+                <span id="statusText" class="text-sm font-medium text-slate-300">Chưa kết nối</span>
+            </div>
+            <button id="connectBtn" class="bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs py-2 px-4 rounded-lg shadow transition duration-200">
+                Tìm Bluetooth
+            </button>
+        </div>
+    </header>
+
+    <!-- Bảng điều khiển Sliders -->
+    <main class="space-y-6 my-auto bg-slate-800/80 p-5 rounded-2xl border border-slate-700 backdrop-blur">
+        <!-- Base -->
+        <div>
+            <div class="flex justify-between mb-2 items-center">
+                <label for="baseSlider" class="font-medium text-slate-200 text-sm">Đế Xoay (Base)</label>
+                <span id="baseVal" class="text-blue-400 font-mono font-bold bg-slate-900 px-3 py-1 rounded-lg text-sm">90°</span>
+            </div>
+            <input type="range" id="baseSlider" min="0" max="180" value="90" oninput="updateSliders()">
+        </div>
+
+        <!-- Gripper -->
+        <div>
+            <div class="flex justify-between mb-2 items-center">
+                <label for="gripperSlider" class="font-medium text-slate-200 text-sm">Kẹp Vật (Gripper)</label>
+                <span id="gripperVal" class="text-blue-400 font-mono font-bold bg-slate-900 px-3 py-1 rounded-lg text-sm">90°</span>
+            </div>
+            <input type="range" id="gripperSlider" min="0" max="180" value="90" oninput="updateSliders()">
+        </div>
+
+        <button onclick="resetSliders()" class="w-full bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm font-semibold py-2.5 rounded-xl transition duration-200 mt-2">
+            Reset Vị Trí (90°)
+        </button>
+    </main>
+
+    <!-- Terminal Nhật ký Lệnh -->
+    <footer class="mt-4">
+        <h3 class="text-xs font-semibold text-slate-400 mb-2">Terminal</h3>
+        <div class="bg-black/80 rounded-xl border border-slate-700 p-3 font-mono text-[11px] h-28 overflow-y-auto flex flex-col justify-end">
+            <div id="terminal" class="space-y-1 text-slate-300">
+                <div class="text-slate-500">Sẵn sàng kết nối Bluetooth...</div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        const sliders = {
+            base: document.getElementById('baseSlider'),
+            gripper: document.getElementById('gripperSlider')
+        };
+        const displays = {
+            base: document.getElementById('baseVal'),
+            gripper: document.getElementById('gripperVal')
+        };
+        const btnConnect = document.getElementById('connectBtn');
+        const statusLed = document.getElementById('statusLed');
+        const statusText = document.getElementById('statusText');
+        const terminal = document.getElementById('terminal');
+
+        // Biến Web Bluetooth BLE
+        let bleDevice = null;
+        let gattCharacteristic = null;
+        let isConnected = false;
+
+        // Chuẩn Service & Characteristic UUID phổ biến cho HM-10 / BLE UART
+        const BLE_SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb";
+        const BLE_CHARACTERISTIC_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb";
+
+        // Kiểm tra trình duyệt hỗ trợ Web Bluetooth
+        if (!navigator.bluetooth) {
+            logToTerminal("LỖI: Trình duyệt không hỗ trợ Web Bluetooth API.", "error");
+            btnConnect.disabled = true;
+            btnConnect.classList.add("opacity-50", "cursor-not-allowed");
+        }
+
+        btnConnect.addEventListener('click', async () => {
+            if (isConnected) {
+                disconnectBLE();
+            } else {
+                await connectBLE();
+            }
+        });
+
+        async function connectBLE() {
+            try {
+                logToTerminal("Đang tìm thiết bị BLE...", "info");
+                
+                // Yêu cầu tìm kiếm thiết bị BLE
+                bleDevice = await navigator.bluetooth.requestDevice({
+                    acceptAllDevices: true,
+                    optionalServices: [BLE_SERVICE_UUID, "00001801-0000-1000-8000-00805f9b34fb", "6e400001-b5a3-f393-e0a9-e50e24dcca9e"]
+                });
+
+                bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+                logToTerminal(`Đã chọn: ${bleDevice.name || 'Thiết bị BLE'}`, "info");
+                logToTerminal("Đang kết nối GATT Server...", "info");
+
+                const server = await bleDevice.gatt.connect();
+                
+                // Lấy Service & Characteristic để ghi dữ liệu
+                let service;
+                try {
+                    service = await server.getPrimaryService(BLE_SERVICE_UUID);
+                } catch(e) {
+                    // Thử fallback sang Nordic UART Service nếu là module BLE khác
+                    service = await server.getPrimaryService("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
+                }
+
+                gattCharacteristic = await service.getCharacteristic(
+                    service.uuid === BLE_SERVICE_UUID ? BLE_CHARACTERISTIC_UUID : "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+                );
+
+                isConnected = true;
+                updateUIConnected();
+                logToTerminal("Đã kết nối Bluetooth thành công!", "success");
+
+                sendRobotCommand();
+
+            } catch (error) {
+                console.error("Lỗi Bluetooth:", error);
+                logToTerminal("Lỗi: " + error.message, "error");
+            }
+        }
+
+        function disconnectBLE() {
+            if (bleDevice && bleDevice.gatt.connected) {
+                bleDevice.gatt.disconnect();
+            }
+            onDisconnected();
+        }
+
+        function onDisconnected() {
+            isConnected = false;
+            gattCharacteristic = null;
+            updateUIDisconnected();
+            logToTerminal("Đã ngắt kết nối Bluetooth.", "warning");
+        }
+
+        function updateUIConnected() {
+            btnConnect.textContent = "Ngắt kết nối";
+            btnConnect.classList.replace('bg-blue-600', 'bg-red-600');
+            btnConnect.classList.replace('hover:bg-blue-500', 'hover:bg-red-500');
+            
+            statusLed.classList.replace('status-disconnected', 'status-connected');
+            statusText.textContent = "Đã kết nối";
+            statusText.classList.replace('text-slate-300', 'text-emerald-400');
+        }
+
+        function updateUIDisconnected() {
+            btnConnect.textContent = "Tìm Bluetooth";
+            btnConnect.classList.replace('bg-red-600', 'bg-blue-600');
+            btnConnect.classList.replace('hover:bg-red-500', 'hover:bg-blue-500');
+            
+            statusLed.classList.replace('status-connected', 'status-disconnected');
+            statusText.textContent = "Chưa kết nối";
+            statusText.classList.replace('text-emerald-400', 'text-slate-300');
+        }
+
+        function updateSliders() {
+            const vBase = sliders.base.value;
+            const vGripper = sliders.gripper.value;
+
+            displays.base.textContent = vBase + '°';
+            displays.gripper.textContent = vGripper + '°';
+
+            sendRobotCommand(vBase, vGripper);
+        }
+
+        function resetSliders() {
+            sliders.base.value = 90;
+            sliders.gripper.value = 90;
+            updateSliders();
+        }
+
+        let isWriting = false;
+
+        async function sendRobotCommand(b = sliders.base.value, g = sliders.gripper.value) {
+            if (!isConnected || !gattCharacteristic) return;
+            if (isWriting) return;
+
+            isWriting = true;
+            const commandString = `${b},${g}\n`;
+            const encoder = new TextEncoder();
+
+            try {
+                // Gửi dữ liệu xuống thiết bị BLE dạng ArrayBuffer
+                await gattCharacteristic.writeValueWithoutResponse(encoder.encode(commandString));
+                logToTerminal(`> Gửi: ${commandString.trim()}`, "info");
+            } catch (error) {
+                // Fallback nếu không hỗ trợ Write Without Response
+                try {
+                    await gattCharacteristic.writeValue(encoder.encode(commandString));
+                    logToTerminal(`> Gửi: ${commandString.trim()}`, "info");
+                } catch(err) {
+                    console.error("Lỗi khi gửi BLE:", err);
+                }
+            } finally {
+                isWriting = false;
+            }
+        }
+
+        function logToTerminal(message, type = "info") {
+            const div = document.createElement('div');
+            const now = new Date();
+            const timeStr = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
+            
+            let colorClass = "text-slate-300";
+            if (type === "error") colorClass = "text-red-400";
+            if (type === "success") colorClass = "text-emerald-400";
+            if (type === "warning") colorClass = "text-yellow-400";
+            if (type === "info") colorClass = "text-blue-300";
+
+            div.className = colorClass;
+            div.innerHTML = `<span class="text-slate-600">[${timeStr}]</span> ${message}`;
+            
+            terminal.appendChild(div);
+            
+            const terminalContainer = terminal.parentElement;
+            terminalContainer.scrollTop = terminalContainer.scrollHeight;
+
+            while (terminal.children.length > 12) {
+                terminal.removeChild(terminal.firstChild);
+            }
+        }
+    </script>
+</body>
+</html>
